@@ -295,12 +295,14 @@ struct Slot {
     bool valid = false;
     uint64_t gen = 0, indexOff = 0, indexStored = 0, indexRaw = 0, indexXxh = 0;
     uint32_t flags = 0;
+    uint16_t version = kVersion;
 };
 
 Slot readSlot(const uint8_t* p) {
     Slot s;
     if (std::memcmp(p, kMagic, 8) != 0) return s;
-    if (rd16(p + 8) != kVersion) return s;
+    s.version = rd16(p + 8);
+    if (s.version < kVersion || s.version > kMaxVersion) return s; // versao futura: este leitor nao a entende
     if (xxh64(p, 56) != rd64(p + 56)) return s;
     s.flags = rd32(p + 12);
     s.gen = rd64(p + 16);
@@ -315,7 +317,7 @@ Slot readSlot(const uint8_t* p) {
 std::string makeSlot(const Slot& s) {
     std::string o;
     o.append(kMagic, 8);
-    put16(o, kVersion);
+    put16(o, s.version);
     put16(o, 0);
     put32(o, s.flags);
     put64(o, s.gen);
@@ -460,6 +462,10 @@ bool Archive::open(const std::string& path, std::string* err) {
     Slot order[2] = {a, b};
     if (b.valid && (!a.valid || b.gen > a.gen)) std::swap(order[0], order[1]);
     std::string lastErr = "nenhum slot de cabecalho valido (nao e' um .tuf ou esta' corrompido)";
+    for (const uint8_t* sp : {m.base, m.base + kSlotSize}) // versao do formato que este leitor nao conhece: dizer isso
+        if (std::memcmp(sp, kMagic, 8) == 0 && rd16(sp + 8) > kMaxVersion)
+            lastErr = "versao " + std::to_string(rd16(sp + 8)) + " do formato .tuf nao suportada (este leitor entende ate' a " +
+                      std::to_string(kMaxVersion) + "); atualize o Tufo";
     for (const Slot& s : order) {
         if (!s.valid) continue;
         if (s.indexOff < kHeaderSize || s.indexStored > m.size || s.indexOff > m.size - s.indexStored) {
@@ -524,6 +530,7 @@ bool Archive::stat(const std::string& key, Info* info) const {
         info->rawSize = e->raw;
         info->mtime = e->mtime;
         info->xxh64 = e->full;
+        info->flags = e->flags;
         info->segments = e->kind == 0 ? 1u : static_cast<uint32_t>(m_impl->idx.comps[e->ref].size());
         info->storedSize = 0;
         if (e->kind == 0) info->storedSize = m_impl->idx.blobs[e->ref].stored;
@@ -571,6 +578,7 @@ std::vector<EntryInfo> Archive::listInfo(const std::string& dir) const {
         ei.info.rawSize = e->raw;
         ei.info.mtime = e->mtime;
         ei.info.xxh64 = e->full;
+        ei.info.flags = e->flags;
         auto addBlob = [&](uint32_t b) {
             ei.info.storedSize += m.idx.blobs[b].stored;
             ei.codecMask = static_cast<uint8_t>(ei.codecMask | (1u << (m.idx.blobs[b].codec & 7)));
@@ -672,6 +680,7 @@ struct Ent {
     uint64_t raw = 0;
     int64_t mtime = 0;
     uint64_t full = 0;
+    uint8_t flags = 0;
 };
 
 // Fim de um PNG que comeca em p[start] (assinatura + chunks ate' o IEND); 0 se nao for.
@@ -802,7 +811,7 @@ bool Writer::append(const std::string& path, std::string* err) {
     m.idx = ai.idx;
     m.idx.entries.clear();
     for (const EntryRec& e : ai.idx.entries)
-        m.ents[std::string(ai.idx.pathOf(e))] = Ent{e.kind, e.ref, e.raw, e.mtime, e.full};
+        m.ents[std::string(ai.idx.pathOf(e))] = Ent{e.kind, e.ref, e.raw, e.mtime, e.full, e.flags};
     for (size_t i = 0; i < m.idx.blobs.size(); ++i) {
         const BlobRec& b = m.idx.blobs[i];
         m.known.emplace(BlobKey{b.h1, b.h2, b.raw}, static_cast<uint32_t>(i));
@@ -998,6 +1007,7 @@ bool Writer::commit(PreparedFile&& f, std::string* err) {
     e.raw = f.raw;
     e.mtime = f.mtime;
     e.full = f.full;
+    e.flags = f.flags;
     if (!f.composite && ids.size() == 1) {
         e.kind = 0;
         e.ref = ids[0];
@@ -1029,6 +1039,7 @@ bool Writer::finish(std::string* err) {
     // Descarta composicoes orfas (de entradas trocadas ou removidas): so' as
     // vivas vao para o indice novo, com os numeros refeitos.
     std::vector<std::vector<uint32_t>> comps;
+    bool needV2 = false; // so' um pacote com entrada de texturas prontas exige o leitor novo
     for (const auto& kv : m.ents) {
         EntryRec e;
         e.pathHash = xxh64(kv.first.data(), kv.first.size());
@@ -1039,6 +1050,8 @@ bool Writer::finish(std::string* err) {
         e.raw = kv.second.raw;
         e.mtime = kv.second.mtime;
         e.full = kv.second.full;
+        e.flags = kv.second.flags;
+        if (e.flags) needV2 = true;
         if (kv.second.kind == 0) {
             e.ref = kv.second.ref;
         } else {
@@ -1067,6 +1080,8 @@ bool Writer::finish(std::string* err) {
     if (!m.appendBytes(stored.data(), stored.size(), off, err)) return false;
     if (::fsync(m.fd) != 0) return failWith(err, "fsync falhou");
     Slot s;
+    s.version = needV2 ? kVersionBaked : kVersion;
+    s.flags = needV2 ? 1u : 0u;
     s.gen = m.generation + 1;
     s.indexOff = off;
     s.indexStored = storedSize;
@@ -1115,7 +1130,7 @@ bool repack(const std::string& inPath, const std::string& outPath, std::string* 
         return true;
     };
     for (const EntryRec& e : ai.idx.entries) {
-        Ent n{e.kind, 0, e.raw, e.mtime, e.full};
+        Ent n{e.kind, 0, e.raw, e.mtime, e.full, e.flags};
         if (e.kind == 0) {
             if (!copyBlob(e.ref)) return false;
             n.ref = static_cast<uint32_t>(remap[e.ref]);

@@ -7,12 +7,16 @@
 #include <fstream>
 #include <map>
 #include <thread>
+#include <unordered_set>
 
 namespace tufo {
 
 namespace fs = std::filesystem;
 
 namespace {
+
+GpuReadyCodec g_codec;
+bool g_codecSet = false;
 
 bool fail(std::string* err, const std::string& m) {
     if (err) *err = m;
@@ -53,7 +57,7 @@ std::vector<Job> collectJobs(const std::vector<std::string>& paths, const AddOpt
     auto add = [&](const fs::path& f) {
         Job j;
         j.file = f;
-        const fs::path rel = opt.base.empty() ? f.filename() : fs::relative(f, base, ec);
+        const fs::path rel = opt.base.empty() ? f.filename() : (f.lexically_relative(base).empty() ? fs::relative(f, base, ec) : f.lexically_relative(base));
         j.key = pre + rel.generic_string();
         j.size = fs::file_size(f, ec);
         jobs.push_back(std::move(j));
@@ -130,6 +134,23 @@ TreeNode buildTree(const std::vector<EntryInfo>& entries) {
     return root;
 }
 
+void setGpuReadyCodec(GpuReadyCodec codec) {
+    g_codec = std::move(codec);
+    g_codecSet = static_cast<bool>(g_codec.pack) && static_cast<bool>(g_codec.unpack);
+}
+const GpuReadyCodec* gpuReadyCodec() { return g_codecSet ? &g_codec : nullptr; }
+
+bool readRestored(const Archive& ar, const std::string& key, std::vector<uint8_t>& out, std::string* err) {
+    Info info;
+    if (!ar.stat(key, &info)) return fail(err, "entrada inexistente: " + key);
+    if (!ar.read(key, out, true, err)) return false;
+    if (!(info.flags & kFlagGpuReady)) return true;
+    if (!g_codecSet) return fail(err, key + ": entrada com texturas prontas para a GPU; remontar o .glb exige o codec do motor (eruption-engine --tuf-extract)");
+    std::vector<uint8_t> stored = std::move(out);
+    out.clear();
+    return g_codec.unpack(normalizeKey(key), stored, ar, out, err);
+}
+
 std::string codecLabel(uint8_t mask) {
     static const char* names[3] = {"raw", "zstd", "zstd+dict"};
     std::string s;
@@ -169,7 +190,10 @@ long extractTo(const Archive& ar, const std::string& target, const std::string& 
             return -1;
         }
         std::string e2;
-        if (!ar.read(k, d, true, &e2)) {
+        Info ki;
+        // A companheira (pacote de texturas) vai dentro do .glb remontado.
+        if (g_codecSet && ar.stat(k, &ki) && (ki.flags & kFlagCompanion)) continue;
+        if (!readRestored(ar, k, d, &e2)) {
             fail(err, k + ": " + e2);
             return -1;
         }
@@ -183,6 +207,21 @@ long extractTo(const Archive& ar, const std::string& target, const std::string& 
             return -1;
         }
         ++ok;
+        // Imagens por uri que o pacote de texturas cobre e o .tuf nao guarda: saem do formato de bloco.
+        if (g_codecSet && g_codec.unpackExtras && ar.stat(k, &ki) && (ki.flags & kFlagGpuReady)) {
+            std::vector<uint8_t> stored;
+            std::vector<std::pair<std::string, std::vector<uint8_t>>> extra;
+            if (ar.read(k, stored, true, &e2) && g_codec.unpackExtras(normalizeKey(k), stored, ar, extra, &e2)) {
+                for (auto& x : extra) {
+                    if (ar.exists(normalizeKey(x.first))) continue;
+                    const fs::path xd = fs::path(outDir) / x.first;
+                    fs::create_directories(xd.parent_path(), ec);
+                    std::ofstream xf(xd, std::ios::binary | std::ios::trunc);
+                    xf.write(reinterpret_cast<const char*>(x.second.data()), static_cast<std::streamsize>(x.second.size()));
+                    if (xf) ++ok;
+                }
+            }
+        }
         if (progress) progress->done = static_cast<uint64_t>(ok);
     }
     return ok;
@@ -190,9 +229,29 @@ long extractTo(const Archive& ar, const std::string& target, const std::string& 
 
 long addPaths(const std::string& tuf, const std::vector<std::string>& paths, const AddOptions& opt, Progress* progress,
               std::string* err) {
-    const std::vector<Job> jobs = collectJobs(paths, opt);
+    std::vector<Job> jobs = collectJobs(paths, opt);
+    if (opt.gpuReady) {
+        // Pacote de texturas solto em disco (<glb>.*.etexpack) e' cache derivado: o
+        // codec o reaproveita ou refaz e o grava como entrada companheira; entrar
+        // tambem como arquivo comum apagaria a marca da companheira.
+        const auto isCache = [](const Job& j) {
+            static const std::string suf = ".etexpack";
+            return j.key.size() > suf.size() && j.key.compare(j.key.size() - suf.size(), suf.size(), suf) == 0;
+        };
+        jobs.erase(std::remove_if(jobs.begin(), jobs.end(), isCache), jobs.end());
+        // Os .glb primeiro: o que o pacote de texturas de cada um cobre (imagens por uri) so' e' conhecido
+        // depois de assar, e essas imagens nao entram.
+        std::stable_partition(jobs.begin(), jobs.end(), [](const Job& j) {
+            return j.key.size() > 4 && j.key.compare(j.key.size() - 4, 4, ".glb") == 0;
+        });
+    }
+    std::unordered_set<std::string> skipKeys;
     if (jobs.empty()) {
         fail(err, "no files to add");
+        return -1;
+    }
+    if (opt.gpuReady && !g_codecSet) {
+        fail(err, "--gpu-ready exige o codec de texturas do motor: use eruption-engine --tuf-pack ... --gpu-ready");
         return -1;
     }
     Writer w;
@@ -234,13 +293,52 @@ long addPaths(const std::string& tuf, const std::vector<std::string>& paths, con
         // Lote: ate' 256 arquivos ou ~256 MB crus; preparado em paralelo, gravado em ordem.
         size_t j = i;
         uint64_t sum = 0;
-        while (j < jobs.size() && j - i < 256 && (j == i || sum + jobs[j].size <= (256ull << 20))) sum += jobs[j++].size;
+        // gpuReady: cada .glb vira varios pacotes de texturas na memoria (um por combinacao de preset); lote
+        // pequeno para o pico ficar longe do teto de memoria (8 GB estourou com 256 arquivos).
+        const size_t maxFiles = opt.gpuReady ? 8 : 256;
+        const uint64_t maxRaw = opt.gpuReady ? (48ull << 20) : (256ull << 20);
+        while (j < jobs.size() && j - i < maxFiles && (j == i || sum + jobs[j].size <= maxRaw)) sum += jobs[j++].size;
         std::vector<PreparedFile> prepared(j - i);
         std::vector<char> okRead(j - i, 1);
+        // Arquivos que o codec assume (.glb com imagens): em UM fio, porque o
+        // codec ja' usa todos os nucleos por dentro; o resto segue em paralelo.
+        std::vector<std::vector<uint8_t>> replaced(j - i);
+        std::vector<GpuReadyCodec::Companions> companions(j - i);
+        std::vector<char> baked(j - i, 0);
+        if (opt.gpuReady) {
+            std::vector<uint8_t> src;
+            std::vector<std::string> newSkip;
+            for (size_t k = i; k < j; ++k) {
+                const std::string& jk = jobs[k].key;
+                if (jk.size() <= 4 || jk.compare(jk.size() - 4, 4, ".glb") != 0) continue; // so' o .glb e' do codec
+                if (!readFile(jobs[k].file, src)) {
+                    okRead[k - i] = 0;
+                    continue;
+                }
+                std::string cerr;
+                if (g_codec.pack(jobs[k].key, jobs[k].file.string(), src, replaced[k - i], companions[k - i], newSkip, &cerr)) {
+                    baked[k - i] = 1;
+                    for (std::string& sk : newSkip) skipKeys.insert(std::move(sk));
+                    newSkip.clear();
+                }
+                else if (!cerr.empty()) // um mapa que nao da' para assar entra como veio (o motor o comprime ao carregar)
+                    std::fprintf(stderr, "aviso: %s entrou sem texturas prontas: %s\n", jobs[k].key.c_str(), cerr.c_str());
+            }
+        }
+        std::vector<char> skipped(j - i, 0);
+        if (opt.gpuReady)
+            for (size_t k = i; k < j; ++k) skipped[k - i] = skipKeys.count(jobs[k].key) ? 1 : 0;
         std::atomic<size_t> next{i};
         auto work = [&]() {
             std::vector<uint8_t> buf;
             for (size_t k = next.fetch_add(1); k < j; k = next.fetch_add(1)) {
+                if (skipped[k - i]) continue;
+                if (baked[k - i]) {
+                    prepared[k - i] = w.prepare(jobs[k].key, replaced[k - i].data(), replaced[k - i].size(),
+                                                mtimeSeconds(jobs[k].file), wo);
+                    prepared[k - i].flags = kFlagGpuReady;
+                    continue;
+                }
                 if (!readFile(jobs[k].file, buf)) {
                     okRead[k - i] = 0;
                     continue;
@@ -252,11 +350,29 @@ long addPaths(const std::string& tuf, const std::vector<std::string>& paths, con
         for (unsigned t = 0; t < threads; ++t) th.emplace_back(work);
         for (auto& t : th) t.join();
         for (size_t k = i; k < j; ++k) {
+            if (skipped[k - i]) { // coberto pelo pacote de texturas de um .glb: nao entra
+                ++done;
+                if (progress) progress->done = static_cast<uint64_t>(done);
+                continue;
+            }
             if (!okRead[k - i]) {
                 fail(err, "could not read " + jobs[k].file.string());
                 return -1;
             }
+            if (prepared[k - i].key.empty()) {
+                fail(err, "caminho invalido: " + jobs[k].key);
+                return -1;
+            }
             if (!w.commit(std::move(prepared[k - i]), err)) return -1;
+            for (auto& c : companions[k - i]) {
+                if (normalizeKey(c.first).empty()) {
+                    fail(err, "caminho invalido (texturas prontas): " + c.first);
+                    return -1;
+                }
+                PreparedFile cf = w.prepare(normalizeKey(c.first), c.second.data(), c.second.size(), mtimeSeconds(jobs[k].file), wo);
+                cf.flags = kFlagCompanion;
+                if (!w.commit(std::move(cf), err)) return -1;
+            }
             ++done;
             if (progress) progress->done = static_cast<uint64_t>(done);
         }

@@ -1,4 +1,4 @@
-# The .tuf format, version 1
+# The .tuf format, versions 1 and 2
 
 A `.tuf` file ("Eruption Tuff Archive") is a read-optimized, append-safe archive that behaves as a **virtual folder**: a reader asks for `assets/x/x.glb` and receives only that entry, decompressed on the spot, without touching the rest of the file.
 
@@ -23,9 +23,9 @@ The header holds two copies of a 64-byte slot, at offsets 0 and 64.
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 8 | magic `"ERUPTUF\0"` (`45 52 55 50 54 55 46 00`) |
-| 8 | 2 | format version (`1`) |
+| 8 | 2 | format version (`1`, or `2` when the archive has entries with flags, section 9) |
 | 10 | 2 | minor version (`0`, ignored by readers) |
-| 12 | 4 | flags (`0`, reserved) |
+| 12 | 4 | flags (`0`; bit 0 = the archive has GPU-ready entries, set together with version `2`) |
 | 16 | 8 | generation (starts at 1, +1 on every commit) |
 | 24 | 8 | offset of the index |
 | 32 | 8 | stored size of the index |
@@ -33,7 +33,7 @@ The header holds two copies of a 64-byte slot, at offsets 0 and 64.
 | 48 | 8 | XXH64 of the raw index |
 | 56 | 8 | XXH64 of bytes 0..55 of this slot |
 
-**Choosing the slot.** A slot is valid when the magic and version match and its own XXH64 (bytes 56..63) is correct. The reader tries the valid slot with the highest generation first and falls back to the other one if the index it points to is outside the file, does not decompress, fails its XXH64, or fails the structural checks of section 3. A commit with generation `g` is written to slot `g & 1`, so the slot that held the previous state is never touched.
+**Choosing the slot.** A slot is valid when the magic matches, the version is `1` or `2` (a reader that knows only version 1 sees no valid slot and refuses the file)  and its own XXH64 (bytes 56..63) is correct. The reader tries the valid slot with the highest generation first and falls back to the other one if the index it points to is outside the file, does not decompress, fails its XXH64, or fails the structural checks of section 3. A commit with generation `g` is written to slot `g & 1`, so the slot that held the previous state is never touched.
 
 **The index.** If `stored size != raw size` the index is a single zstd frame that decompresses to `raw size` bytes; otherwise it is stored as is.
 
@@ -78,7 +78,7 @@ A dictionary is a zstd dictionary stored as raw bytes in the data area; `xxh64` 
 
 ### 3.3 Entries and path rules
 
-`kind` 0: `ref` is a blob index; the entry is that blob. `kind` 1: `ref` is a composite index; the entry is the **concatenation** of the listed blobs, in order. `rawSize` is the size of the whole file and `fullHash` the XXH64 of the whole file; a verifying read checks it. `flags` is `0`. `pathHash` is the XXH64 of the path bytes and is checked by a full verification.
+`kind` 0: `ref` is a blob index; the entry is that blob. `kind` 1: `ref` is a composite index; the entry is the **concatenation** of the listed blobs, in order. `rawSize` is the size of the whole file and `fullHash` the XXH64 of the whole file; a verifying read checks it. `flags` is `0` in a version 1 archive; in version 2 see section 9. `pathHash` is the XXH64 of the path bytes and is checked by a full verification.
 
 Paths are stored normalized:
 
@@ -118,3 +118,28 @@ This is writer behaviour, not part of the format: readers decode whatever the co
 ## 8. Reading from several threads
 
 After `open()` an `Archive` is immutable: `exists`, `stat`, `read`, `list` and `listInfo` may run concurrently without locks. The file is memory-mapped.
+
+## 9. GPU-ready textures (version 2)
+
+A game that ships `.glb` files with embedded images normally compresses those images to a block format (BC1/3/5/7, with mip chains and derived PBR maps) the first time it loads them, and caches the result next to the file. Version 2 lets the archive carry that result, so a reader loads it with no compression and no cache on disk.
+
+**Entry flags** (the `flags` byte of an entry, section 3.3):
+
+| Bit | Name | Meaning |
+|---|---|---|
+| 0 (`1`) | `GpuReady` | The entry is a `.glb` stored **without its embedded images**: each image's bytes are replaced by a small marker (`"ERUPSTRP"` + offset, length, FNV-1a hash and file name of the original bytes; the glTF `images`, `bufferViews` and everything else stay in place). The GPU-ready textures are in a companion entry. |
+| 1 (`2`) | `Companion` | The entry is the texture package of a `GpuReady` entry: the file `<path of the .glb>.<cap><s|n>[.<format tag>].etexpack` in the same folder. It is an ordinary blob (zstd or raw) holding, per image, the block-compressed albedo, normal and MRAH-W (height in alpha) maps with all mips, exactly the bytes the Eruption Engine uses at run time, plus the average ground albedo. The format of the package is the engine's (`src/utils/EmbeddedTextureBake.cpp`, `kPackVersion`); Tufo treats it as opaque bytes. |
+
+Both bits are `0` for every other entry. Unknown bits must be ignored by readers of version 2.
+
+**Version rule.** A writer emits version `2` (and header flag bit 0) only if at least one entry has a non-zero `flags`; otherwise it writes version `1`, so archives without GPU-ready entries stay readable by every old reader. New readers read versions 1 and 2. A reader that supports only version 1 does not find a valid header slot and refuses the whole file (it cannot be tricked into serving a `.glb` that lacks its images); a reader of this specification reports "format version N not supported" for versions above 2.
+
+**Reading by a game.** `Archive::read` returns the stored bytes as they are (the stripped `.glb` and the package as separate entries); the engine parses the stripped `.glb`, asks for the package by name, validates its header against the preset and GPU (cap, format set; the source size and fingerprint of the original `.glb` are not checked, because the package was written together with the stripped `.glb` in the same archive) and uploads the blocks directly. If the package does not fit the running preset or GPU the engine reports an error: there are no images left to compress (repack the map for that preset).
+
+**Restoring (viewers and extractors).** Producing and undoing the format needs a block compressor and a block decoder, which Tufo does not contain; the host program registers a codec (`tufo::setGpuReadyCodec` in `tufo/Ops.hpp`). With it, `extractTo`, `readRestored`, `tufo cat` and the engine's `--tuf-extract` rebuild the `.glb` with an embedded PNG for every image, decoded from mip 0 of the stored albedo block data, and do not write companion entries. This is **lossy**: the pixels are the BC-decoded ones at the capped resolution (at most the cap, e.g. 1024), not the original image, and PBR maps are not restored (the glTF never held them). Without a codec (the standalone `tufo` binary), extracting a `GpuReady` entry fails with an explicit message; `list` marks such entries `[gpu-ready]` and companions `[texturas da gpu]`. `verify` works everywhere: it checks blobs and hashes only.
+
+**Several companions per `.glb`.** Because the stripped `.glb` no longer holds the images, every format the program can ask for must be in the archive. The writer therefore stores one companion per distinct *combination* that any preset can select: (resolution cap, PBR synthesis on/off, compression options), the same triple that is encoded in the companion's name (`<cap><s|n>[.<format tag>]`). For the Eruption Engine the list comes from `data/graphics.json` merged with the game's patch, family BC: e.g. `1024s` (high, medium), `512n` (low) and `256n` (the smallest mobile preset) side by side. At load time the engine reads the companion named for the running preset, so every preset works with a migrated map; a combination that is not in the archive (a new preset, a GPU without BC) fails with an explicit error. Companions with identical content are deduplicated by the blob mechanism of section 4. An image is removed from the `.glb` only if every companion covers it.
+
+Pixels that the engine needs from the original image outside the texture upload (terrain masks, relief height with PBR synthesis off, mesh LOD) are taken from mip 0 of the stored albedo of the running preset's companion, so for presets with a lower cap they come at that cap (lossy, like the extraction above).
+
+**Writing.** `tufo pack/add ... --gpu-ready` (available through `eruption-engine --tuf-pack`, which carries the codec): every `.glb` with embedded images is baked for every combination above (`ERUPTION_PROJECT=<game folder>` adds the game's graphics patch), a valid `.etexpack` already on disk next to the `.glb` is reused for the combination it belongs to (the bytes are then those the engine already uses), the stripped `.glb` is stored with `GpuReady` and each package with `Companion`. Loose `*.etexpack` files in the input folders are not stored as ordinary files. Files with no embedded images are stored as usual. Re-running over an archive replaces the entries of the files given, so the archive can be rebuilt later from other source images (for example upscaled ones).

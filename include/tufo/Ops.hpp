@@ -6,10 +6,48 @@
 
 #include "tufo/Archive.hpp"
 
+#include <functional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace tufo {
+
+// ---- texturas prontas para a GPU (formato versao 2, docs/format.md secao 9) --
+//
+// O Tufo nao sabe comprimir textura nem montar .glb: quem sabe (o motor)
+// registra este codec antes de chamar a CLI ou o painel. Sem codec registrado,
+// empacotar com gpuReady falha com mensagem clara, e extrair uma entrada
+// kFlagGpuReady tambem (o .glb guardado nao tem as imagens).
+struct GpuReadyCodec {
+    using Companions = std::vector<std::pair<std::string, std::vector<uint8_t>>>;
+    // Empacotar: `key` e' o caminho virtual do arquivo, `diskPath` onde ele esta'
+    // no disco e `bytes` o conteudo. false = nao e' um arquivo que o codec trata (entra como e'). true =
+    // `stored` e' o que se guarda no lugar do arquivo e `companions` as entradas
+    // extras (caminho virtual, bytes) que ficam ao lado. `skip` recebe os caminhos virtuais
+    // de arquivos que o pacote de texturas ja' cobre (imagens por uri): nao entram no .tuf.
+    std::function<bool(const std::string& key, const std::string& diskPath, const std::vector<uint8_t>& bytes,
+                       std::vector<uint8_t>& stored, Companions& companions, std::vector<std::string>& skip,
+                       std::string* err)>
+        pack;
+    // Extrair: reconstroi o arquivo a partir do guardado e das entradas
+    // companheiras do mesmo pacote. O resultado e' equivalente, nao identico
+    // (as imagens voltam decodificadas do formato de bloco: com perda).
+    std::function<bool(const std::string& key, const std::vector<uint8_t>& stored, const Archive& ar,
+                       std::vector<uint8_t>& out, std::string* err)>
+        unpack;
+    // Arquivos que o pacote cobre e nao foram guardados (as imagens por uri do .glb), remontados
+    // do formato de bloco (com perda): (caminho virtual, bytes). Vazio/ausente = nenhum.
+    std::function<bool(const std::string& key, const std::vector<uint8_t>& stored, const Archive& ar,
+                       std::vector<std::pair<std::string, std::vector<uint8_t>>>& files, std::string* err)>
+        unpackExtras;
+};
+void setGpuReadyCodec(GpuReadyCodec codec);
+const GpuReadyCodec* gpuReadyCodec(); // nullptr se ninguem registrou
+
+// Le' a entrada como o usuario a quer ver: uma kFlagGpuReady volta remontada
+// (com o codec), o resto como esta'. Falha com mensagem se faltar o codec.
+bool readRestored(const Archive& ar, const std::string& key, std::vector<uint8_t>& out, std::string* err);
 
 // Arvore virtual das entradas: pastas e arquivos, em ordem de nome.
 struct TreeNode {
@@ -45,6 +83,7 @@ struct AddOptions {
     bool create = false;   // true: arquivo novo (falha se existe e !overwrite)
     bool overwrite = false;
     bool train = false;    // treina dicionario com os arquivos pequenos
+    bool gpuReady = false; // .glb com imagens embutidas entram ja' comprimidos para a GPU (exige o codec)
 };
 // Acrescenta arquivos ou pastas do disco (recursivo) ao .tuf, criando-o se
 // preciso. Seguro: o indice novo so' vale depois do ultimo byte gravado.

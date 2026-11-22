@@ -61,11 +61,27 @@ namespace tufo {
 
 constexpr char kMagic[8] = {'E', 'R', 'U', 'P', 'T', 'U', 'F', '\0'};
 constexpr uint16_t kVersion = 1;
+// Versao 2: o pacote tem entradas com flags (texturas prontas para a GPU, ver
+// docs/format.md secao 9). O escritor so' grava 2 se existir uma; sem elas o
+// arquivo continua versao 1 e qualquer leitor antigo o abre.
+constexpr uint16_t kVersionBaked = 2;
+constexpr uint16_t kMaxVersion = 2;
 constexpr size_t kSlotSize = 64;
 constexpr size_t kHeaderSize = 2 * kSlotSize;
 constexpr size_t kAlign = 16;
 
 enum Codec : uint8_t { kRaw = 0, kZstd = 1, kZstdDict = 2 };
+
+// Flags da entrada (so' versao 2).
+enum EntryFlag : uint8_t {
+    // .glb guardado SEM as imagens embutidas (no lugar de cada uma, um marcador
+    // pequeno); as texturas, ja' comprimidas para a GPU, estao na entrada
+    // companheira. Ao extrair, o leitor remonta o .glb com PNG decodificados.
+    kFlagGpuReady = 1,
+    // Entrada companheira de uma kFlagGpuReady (o pacote de texturas): o motor
+    // a le' direto; extratores nao a gravam (ela esta' dentro do .glb remontado).
+    kFlagCompanion = 2,
+};
 
 // XXH64 (algoritmo de Yann Collet, dominio publico).
 uint64_t xxh64(const void* data, size_t size, uint64_t seed = 0);
@@ -78,6 +94,7 @@ struct Info {
     uint64_t xxh64 = 0;      // do conteudo inteiro
     int64_t mtime = 0;       // segundos unix
     uint32_t segments = 1;   // >1: entrada composta
+    uint8_t flags = 0;       // EntryFlag
 };
 
 // Entrada com o que a interface mostra: o codec dos blobs e se algum deles e'
@@ -175,6 +192,7 @@ struct PreparedFile {
     int64_t mtime = 0;
     uint64_t raw = 0, full = 0;
     bool composite = false;
+    uint8_t flags = 0;       // EntryFlag
     std::vector<PreparedBlob> blobs;
 };
 

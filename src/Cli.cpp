@@ -30,7 +30,7 @@ struct Args {
     std::string base;
     int level = 19;
     unsigned threads = 0;
-    bool dict = false, noSplit = false, overwrite = false, help = false;
+    bool dict = false, noSplit = false, overwrite = false, help = false, gpuReady = false;
     std::string prefix;
 };
 
@@ -46,6 +46,7 @@ Args parseArgs(int argc, char** argv, int from) {
         else if (s == "--dict") a.dict = true;
         else if (s == "--no-split") a.noSplit = true;
         else if (s == "--overwrite") a.overwrite = true;
+        else if (s == "--gpu-ready") a.gpuReady = true;
         else a.pos.push_back(s);
     }
     if (a.threads == 0) a.threads = std::max(1u, std::thread::hardware_concurrency() / 2);
@@ -90,6 +91,7 @@ int cmdPack(const std::string& tuf, const Args& a, bool create) {
     o.create = create;
     o.overwrite = a.overwrite;
     o.train = a.dict;
+    o.gpuReady = a.gpuReady;
     Progress prog;
     std::string err;
     long n;
@@ -123,8 +125,9 @@ int cmdList(const std::string& tuf, const Args& a) {
     for (const std::string& k : ar.list(a.pos.empty() ? "" : a.pos[0])) {
         Info i;
         ar.stat(k, &i);
-        std::printf("%12llu %12llu %2u %016llx %s\n", (unsigned long long)i.rawSize, (unsigned long long)i.storedSize, i.segments,
-                    (unsigned long long)i.xxh64, k.c_str());
+        std::printf("%12llu %12llu %2u %016llx %s%s\n", (unsigned long long)i.rawSize, (unsigned long long)i.storedSize, i.segments,
+                    (unsigned long long)i.xxh64, k.c_str(),
+                    (i.flags & kFlagGpuReady) ? "  [gpu-ready]" : (i.flags & kFlagCompanion) ? "  [texturas da gpu]" : "");
     }
     return 0;
 }
@@ -155,7 +158,7 @@ int cmdCat(const std::string& tuf, const Args& a) {
     Archive ar;
     std::string err;
     std::vector<uint8_t> d;
-    if (a.pos.empty() || !ar.open(tuf, &err) || !ar.read(a.pos[0], d, true, &err)) {
+    if (a.pos.empty() || !ar.open(tuf, &err) || !readRestored(ar, a.pos[0], d, &err)) {
         std::fprintf(stderr, "erro: %s\n", err.c_str());
         return 1;
     }
@@ -243,6 +246,8 @@ const char* helpText() {
         "  --dict           treina um dicionario com os arquivos pequenos\n"
         "  --no-split       nao parte os arquivos nos PNG embutidos\n"
         "  --overwrite      pack sobre um arquivo que ja existe\n"
+        "  --gpu-ready      .glb com imagens embutidas entram ja' comprimidas para a GPU (so' no\n"
+        "                   eruption-engine --tuf-pack; formato versao 2, ver docs/format.md secao 9)\n"
         "\n"
         "Exemplos:\n"
         "  tufo pack assets.tuf --base projeto projeto/assets\n"
